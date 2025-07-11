@@ -1,0 +1,242 @@
+/* GrandPay フロント側スタイル */
+
+.grandpay-payment-container {
+    border: 2px solid #e1e5e9;
+    padding: 24px;
+    border-radius: 8px;
+    background: linear-gradient(135deg, #f8f9fa 0%, #ffffff 100%);
+    margin: 24px 0;
+    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+    position: relative;
+    overflow: hidden;
+}
+
+.grandpay-payment-container::before {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 4px;
+    background: linear-gradient(90deg, #0073aa, #00a0d2);
+}
+
+.grandpay-payment-info h3,
+.grandpay-payment-complete h3,
+.grandpay-payment-failed h3 {
+    margin-top: 0;
+    margin-bottom: 16px;
+    font-size: 20px;
+    font-weight: 600;
+}
+
+.grandpay-payment-info h3 {
+    color: #0073aa;
+}
+
+.grandpay-payment-complete h3 {
+    color: #46b450;
+}
+
+.grandpay-payment-failed h3 {
+    color: #dc3232;
+}
+
+.grandpay-payment-btn {
+    background: linear-gradient(135deg, #0073aa 0%, #00a0d2 100%);
+    color: white;
+    border: none;
+    padding: 14px 28px;
+    font-size: 16px;
+    font-weight: 600;
+    border-radius: 6px;
+    cursor: pointer;
+    transition: all 0.3s ease;
+    box-shadow: 0 2px 6px rgba(0, 115, 170, 0.3);
+    position: relative;
+    overflow: hidden;
+}
+
+.grandpay-payment-btn:before {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: -100%;
+    width: 100%;
+    height: 100%;
+    background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.2), transparent);
+    transition: left 0.5s ease;
+}
+
+.grandpay-payment-btn:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 4px 12px rgba(0, 115, 170, 0.4);
+}
+
+.grandpay-payment-btn:hover:before {
+    left: 100%;
+}
+
+.grandpay-payment-btn:active {
+    transform: translateY(0);
+}
+
+.grandpay-payment-btn:disabled {
+    background: #ccc;
+    cursor: not-allowed;
+    transform: none;
+    box-shadow: none;
+}
+
+.grandpay-payment-btn:disabled:before {
+    display: none;
+}
+
+.grandpay-loading {
+    text-align: center;
+    padding: 32px 20px;
+    background-color: #f0f8ff;
+    border-radius: 6px;
+    margin-top: 20px;
+}
+
+.grandpay-loading p {
+    margin-bottom: 20px;
+    font-size: 16px;
+    color: #0073aa;
+    font-weight: 500;
+}
+
+.grandpay-spinner {
+    border: 4px solid #e1e5e9;
+    border-top: 4px solid #0073aa;
+    border-radius: 50%;
+    width: 40px;
+    height: 40px;
+    animation: grandpay-spin 1.5s linear infinite;
+    margin: 0 auto;
+}
+
+@keyframes grandpay-spin {
+    0% {
+        transform: rotate(0deg);
+    }
+    100% {
+        transform: rotate(360deg);
+    }
+}
+
+.grandpay-payment-complete {
+    background-color: #f0fff4;
+    border-left: 4px solid #46b450;
+    padding: 20px;
+    border-radius: 0 6px 6px 0;
+}
+
+.grandpay-payment-failed {
+    background-color: #fef7f7;
+    border-left: 4px solid #dc3232;
+    padding: 20px;
+    border-radius: 0 6px 6px 0;
+}
+
+.grandpay-payment-complete p,
+.grandpay-payment-failed p {
+    margin-bottom: 16px;
+    font-size: 15px;
+    line-height: 1.6;
+}
+
+/* 決済方法選択時のスタイル */
+.usces_payment_method_grandpay {
+    border: 2px solid #0073aa;
+    border-radius: 6px;
+    padding: 16px;
+    margin: 8px 0;
+    background-color: #f8fdff;
+}
+
+.usces_payment_method_grandpay label {
+    font-weight: 600;
+    color: #0073aa;
+}
+
+.usces_payment_method_grandpay .payment-description {
+    margin-top: 8px;
+    font-size: 14px;
+    color: #666;
+    line-height: 1.5;
+}
+
+/* レスポンシブ対応 */
+@media (max-width: 768px) {
+    .grandpay-payment-container {
+        padding: 20px 16px;
+        margin: 16px 0;
+    }
+
+    .grandpay-payment-btn {
+        width: 100%;
+        padding: 16px 20px;
+        font-size: 18px;
+    }
+
+    .grandpay-payment-info h3,
+    .grandpay-payment-complete h3,
+    .grandpay-payment-failed h3 {
+        font-size: 18px;
+    }
+}
+
+/* ダークモード対応 */
+@media (prefers-color-scheme: dark) {
+    .grandpay-payment-container {
+        background: linear-gradient(135deg, #2c3e50 0%, #34495e 100%);
+        border-color: #4a6741;
+        color: #ecf0f1;
+    }
+
+    .grandpay-loading {
+        background-color: #34495e;
+    }
+
+    .grandpay-loading p {
+        color: #3498db;
+    }
+
+    .grandpay-spinner {
+        border-color: #4a6741;
+        border-top-color: #3498db;
+    }
+}
+
+/* アニメーション効果 */
+.grandpay-payment-container {
+    animation: grandpay-fadeIn 0.5s ease-out;
+}
+
+@keyframes grandpay-fadeIn {
+    from {
+        opacity: 0;
+        transform: translateY(20px);
+    }
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}
+
+/* フォーカス対応（アクセシビリティ） */
+.grandpay-payment-btn:focus {
+    outline: 2px solid #0073aa;
+    outline-offset: 2px;
+}
+
+/* 印刷時の調整 */
+@media print {
+    .grandpay-payment-btn {
+        background: #0073aa !important;
+        -webkit-print-color-adjust: exact;
+        color-adjust: exact;
+    }
+}
