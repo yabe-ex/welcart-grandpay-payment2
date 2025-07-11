@@ -1,9 +1,5 @@
 <?php
 
-/**
- * GrandPay決済処理クラス - 完全版（ステータス確認・URL修正版）
- * Welcartとの統合、チェックアウトセッション作成、コールバック処理を実装
- */
 class WelcartGrandpayPaymentProcessor {
 
     private $api;
@@ -11,8 +7,9 @@ class WelcartGrandpayPaymentProcessor {
     public function __construct() {
         $this->api = new WelcartGrandpayAPI();
 
-        // Welcartの決済フックに登録
-        add_action('usces_action_acting_processing', array($this, 'process_payment'), 10);
+        // 🚨 重要: usces_action_acting_processing フックは削除
+        // これは settlement/grandpay.php で処理される
+        // add_action('usces_action_acting_processing', array($this, 'process_payment'), 10); // ❌ 削除
 
         // 🔧 修正: コールバック処理をより早いタイミングで登録
         add_action('wp', array($this, 'handle_payment_callback'), 1);  // 最優先で実行
@@ -25,8 +22,11 @@ class WelcartGrandpayPaymentProcessor {
         // REST API登録
         add_action('rest_api_init', array($this, 'register_webhook_endpoint'));
 
-        error_log('GrandPay Payment Processor: Initialized with early callback hooks');
+        error_log('GrandPay Payment Processor: Initialized with callback and webhook hooks only');
     }
+
+    // 🚨 process_payment() メソッドは削除
+    // 決済処理は settlement/grandpay.php の acting_processing() で処理される
 
     /**
      * Webhook用REST APIエンドポイント登録
@@ -39,559 +39,6 @@ class WelcartGrandpayPaymentProcessor {
         ));
 
         error_log('GrandPay Payment: REST API webhook endpoint registered');
-    }
-
-    /**
-     * メイン決済処理 - Welcart決済フロー統合
-     */
-    public function process_payment() {
-        global $usces;
-
-        error_log('GrandPay Payment: process_payment() called');
-
-        // Welcartの決済設定を確認
-        $acting_settings = $usces->options['acting_settings'] ?? array();
-        $acting_flag = $acting_settings['acting_flag'] ?? '';
-
-        error_log('GrandPay Payment: Current acting_flag: ' . $acting_flag);
-
-        // フォームデータも確認
-        $payment_method = $_POST['offer']['payment_method'] ?? '';
-        error_log('GrandPay Payment: Posted payment method: ' . $payment_method);
-
-        // GrandPayが選択されているかチェック
-        $is_grandpay_selected = false;
-
-        if ($acting_flag === 'grandpay') {
-            $is_grandpay_selected = true;
-            error_log('GrandPay Payment: Selected via acting_flag');
-        }
-
-        if (in_array($payment_method, array('acting_grandpay_card', 'grandpay'))) {
-            $is_grandpay_selected = true;
-            error_log('GrandPay Payment: Selected via payment_method');
-        }
-
-        // payment_nameでも確認
-        if (
-            isset($_POST['offer']['payment_name']) &&
-            strpos($_POST['offer']['payment_name'], 'GrandPay') !== false
-        ) {
-            $is_grandpay_selected = true;
-            error_log('GrandPay Payment: Selected via payment_name');
-        }
-
-        if (!$is_grandpay_selected) {
-            error_log('GrandPay Payment: Not GrandPay payment, skipping');
-            return;
-        }
-
-        error_log('GrandPay Payment: GrandPay payment detected, proceeding');
-
-        // GrandPay設定確認
-        $grandpay_options = $acting_settings['grandpay'] ?? array();
-        if (($grandpay_options['activate'] ?? 'off') !== 'on') {
-            error_log('GrandPay Payment: GrandPay not activated');
-            $usces->error_message = 'GrandPay決済が有効になっていません。';
-            $this->redirect_to_cart_with_error($usces->error_message);
-            return;
-        }
-
-        // 注文データを取得・準備
-        $order_data = $this->prepare_order_data();
-        if (!$order_data) {
-            error_log('GrandPay Payment: Failed to prepare order data');
-            $usces->error_message = '注文データの準備に失敗しました';
-            $this->redirect_to_cart_with_error($usces->error_message);
-            return;
-        }
-
-        error_log('GrandPay Payment: Order data prepared: ' . print_r($order_data, true));
-
-        // チェックアウトセッション作成
-        $result = $this->api->create_checkout_session($order_data);
-
-        if (!$result['success']) {
-            error_log('GrandPay Payment: Checkout session creation failed: ' . $result['error']);
-            $usces->error_message = $result['error'];
-            $this->redirect_to_cart_with_error($usces->error_message);
-            return;
-        }
-
-        if (isset($result['session_id']) && isset($result['checkout_url'])) {
-            // 注文情報を保存
-            $this->save_order_data($order_data['order_id'], $result, $order_data);
-
-            error_log('GrandPay Payment: Redirecting to checkout URL: ' . $result['checkout_url']);
-
-            // GrandPayの決済ページにリダイレクト
-            wp_redirect($result['checkout_url']);
-            exit;
-        }
-
-        // 予期しないエラー
-        error_log('GrandPay Payment: Unexpected error in payment processing');
-        $usces->error_message = '決済処理中にエラーが発生しました';
-        $this->redirect_to_cart_with_error($usces->error_message);
-    }
-
-    /**
-     * 注文データを準備（改善版 - 注文ID取得方法強化）
-     */
-    private function prepare_order_data() {
-        global $usces;
-
-        try {
-            // 基本データ取得
-            $cart = $usces->cart;
-            $member = $usces->get_member();
-            $total_price = $usces->get_total_price();
-
-            // 🔧 改善: 注文IDの取得方法を強化
-            $order_id = null;
-            $is_temp_id = false;
-
-            error_log('GrandPay Payment: ========== ORDER ID DETECTION START ==========');
-
-            // 1. セッションから注文IDを取得
-            if (isset($_SESSION['usces_entry']['order_id'])) {
-                $order_id = $_SESSION['usces_entry']['order_id'];
-                error_log('GrandPay Payment: Order ID from session: ' . $order_id);
-            }
-
-            // 2. POSTデータから取得
-            if (!$order_id && isset($_POST['order_id'])) {
-                $order_id = intval($_POST['order_id']);
-                error_log('GrandPay Payment: Order ID from POST: ' . $order_id);
-            }
-
-            // 3. Welcartの内部変数から取得
-            if (!$order_id && isset($usces->current_order_id)) {
-                $order_id = $usces->current_order_id;
-                error_log('GrandPay Payment: Order ID from usces object: ' . $order_id);
-            }
-
-            // 🔧 4. Welcartの注文データベースから最新の注文を取得
-            if (!$order_id) {
-                error_log('GrandPay Payment: Attempting to find latest order in database');
-
-                // 現在のユーザーまたはセッションに関連する最新の注文を検索
-                $recent_orders = get_posts(array(
-                    'post_type' => 'shop_order',
-                    'post_status' => array('draft', 'private', 'publish'),
-                    'numberposts' => 5,
-                    'orderby' => 'date',
-                    'order' => 'DESC',
-                    'meta_query' => array(
-                        array(
-                            'key' => '_order_status',
-                            'value' => array('pending', 'processing', 'new'),
-                            'compare' => 'IN'
-                        )
-                    )
-                ));
-
-                error_log('GrandPay Payment: Found ' . count($recent_orders) . ' recent orders');
-
-                if (!empty($recent_orders)) {
-                    $order_id = $recent_orders[0]->ID;
-                    error_log('GrandPay Payment: Using latest order ID: ' . $order_id);
-                }
-            }
-
-            // 5. 一時的な注文IDを生成（最後の手段）
-            if (!$order_id) {
-                $temp_id = 'TEMP_' . time() . '_' . rand(1000, 9999);
-                $order_id = $temp_id;
-                $is_temp_id = true;
-                error_log('GrandPay Payment: ⚠️ Generated temporary order ID: ' . $order_id);
-
-                // 🔧 一時的IDの場合、後で実際の注文と関連付けるための情報を保存
-                if (isset($_SESSION['usces_entry'])) {
-                    $_SESSION['usces_entry']['grandpay_temp_id'] = $temp_id;
-                    error_log('GrandPay Payment: Saved temp ID to session for later matching');
-                }
-            }
-
-            error_log('GrandPay Payment: Final selected order ID: ' . $order_id . ' (Is temp: ' . ($is_temp_id ? 'YES' : 'NO') . ')');
-
-            // 顧客情報の取得
-            $customer_data = array();
-
-            // 1. セッションのエントリーデータから取得
-            if (isset($_SESSION['usces_entry']['customer'])) {
-                $customer_data = $_SESSION['usces_entry']['customer'];
-                error_log('GrandPay Payment: Customer data from session entry');
-            }
-            // 2. POSTデータから取得
-            elseif (isset($_POST['customer'])) {
-                $customer_data = $_POST['customer'];
-                error_log('GrandPay Payment: Customer data from POST');
-            }
-            // 3. セッションのお客様情報から取得
-            elseif (isset($_SESSION['usces_member'])) {
-                $session_member = $_SESSION['usces_member'];
-                $customer_data = array(
-                    'name1' => $session_member['mem_name1'] ?? '',
-                    'name2' => $session_member['mem_name2'] ?? '',
-                    'mailaddress1' => $session_member['mem_email'] ?? '',
-                    'tel' => $session_member['mem_tel'] ?? ''
-                );
-                error_log('GrandPay Payment: Customer data from session member');
-            }
-            // 4. 会員情報から取得
-            elseif (!empty($member)) {
-                $customer_data = array(
-                    'name1' => $member['mem_name1'] ?? '',
-                    'name2' => $member['mem_name2'] ?? '',
-                    'mailaddress1' => $member['mem_email'] ?? '',
-                    'tel' => $member['mem_tel'] ?? ''
-                );
-                error_log('GrandPay Payment: Customer data from member');
-            }
-
-            // デバッグ: 利用可能なセッションデータをログ出力
-            error_log('GrandPay Payment: Available session keys: ' . print_r(array_keys($_SESSION), true));
-            if (isset($_SESSION['usces_entry'])) {
-                error_log('GrandPay Payment: usces_entry keys: ' . print_r(array_keys($_SESSION['usces_entry']), true));
-            }
-
-            // 顧客情報の統合
-            $customer_name = trim(($customer_data['name1'] ?? '') . ' ' . ($customer_data['name2'] ?? ''));
-            $customer_email = $customer_data['mailaddress1'] ?? $customer_data['email'] ?? '';
-            $customer_phone = $customer_data['tel'] ?? $customer_data['phone'] ?? '';
-
-            // デフォルト値の設定
-            if (empty($customer_email)) {
-                $customer_email = 'noreply@' . ($_SERVER['HTTP_HOST'] ?? 'example.com');
-                error_log('GrandPay Payment: Using default email: ' . $customer_email);
-            }
-
-            if (empty($customer_name)) {
-                $customer_name = 'お客様';
-                error_log('GrandPay Payment: Using default name');
-            }
-
-            // 金額の確認
-            if (empty($total_price) || $total_price <= 0) {
-                $total_price = 1000; // デフォルト金額
-                error_log('GrandPay Payment: Using default amount: ' . $total_price);
-            }
-
-            // URL構築
-            $base_url = home_url();
-
-            // Welcartの標準的なURL構造
-            $complete_url = $base_url . '/usces-member/?page=completionmember';
-            $cart_url = $base_url . '/usces-cart/';
-
-            // usces->urlが利用可能な場合はそれを使用
-            if (isset($usces->url['complete_page'])) {
-                $complete_url = $usces->url['complete_page'];
-            }
-            if (isset($usces->url['cart_page'])) {
-                $cart_url = $usces->url['cart_page'];
-            }
-
-            // 🔧 修正: パラメータ名とnonce追加
-            // コールバック用のnonceを生成
-            $callback_nonce = wp_create_nonce('grandpay_callback_' . $order_id);
-
-            // 修正されたコールバックURL（パラメータ名を統一）
-            $success_url = add_query_arg(array(
-                'grandpay_result' => 'success',
-                'order_id' => $order_id,
-                'session_check' => $callback_nonce
-            ), $complete_url);
-
-            $failure_url = add_query_arg(array(
-                'grandpay_result' => 'failure',
-                'order_id' => $order_id,
-                'session_check' => $callback_nonce
-            ), $cart_url);
-
-            error_log('GrandPay Payment: Generated callback URLs:');
-            error_log('GrandPay Payment: Success URL: ' . $success_url);
-            error_log('GrandPay Payment: Failure URL: ' . $failure_url);
-            error_log('GrandPay Payment: Callback nonce: ' . $callback_nonce);
-
-            $order_data = array(
-                'order_id' => $order_id,
-                'amount' => intval($total_price),
-                'name' => $customer_name,
-                'email' => $customer_email,
-                'phone' => $customer_phone,
-                'success_url' => $success_url,
-                'failure_url' => $failure_url,
-                'is_temp_id' => $is_temp_id  // 🔧 追加: 一時的IDかどうかのフラグ
-            );
-
-            error_log('GrandPay Payment: ========== ORDER ID DETECTION END ==========');
-            error_log('GrandPay Payment: Final order data prepared for order: ' . $order_id);
-
-            return $order_data;
-        } catch (Exception $e) {
-            error_log('GrandPay Payment: Exception in prepare_order_data: ' . $e->getMessage());
-            error_log('GrandPay Payment: Exception trace: ' . $e->getTraceAsString());
-            return false;
-        }
-    }
-
-    /**
-     * 注文データを保存（強化版 - 注文作成・紐付け処理）
-     */
-    private function save_order_data($order_id, $payment_result, $order_data) {
-        error_log('GrandPay Payment: ========== SAVE ORDER DATA START ==========');
-        error_log('GrandPay Payment: Order ID: ' . $order_id);
-        error_log('GrandPay Payment: Is temp ID: ' . (isset($order_data['is_temp_id']) && $order_data['is_temp_id'] ? 'YES' : 'NO'));
-
-        // 🔧 一時的IDの場合の特別処理
-        if (isset($order_data['is_temp_id']) && $order_data['is_temp_id']) {
-            error_log('GrandPay Payment: Handling temporary order ID: ' . $order_id);
-
-            // 1. 一時的IDの情報をセッションに保存
-            $_SESSION['grandpay_temp_order'] = array(
-                'temp_id' => $order_id,
-                'session_id' => $payment_result['session_id'],
-                'checkout_url' => $payment_result['checkout_url'],
-                'created_at' => current_time('mysql'),
-                'order_data' => $order_data
-            );
-
-            error_log('GrandPay Payment: Temporary order data saved to session');
-
-            // 2. 🔧 より強力な実際の注文検索
-            $actual_order_id = $this->find_or_create_actual_order($order_data, $payment_result);
-
-            if ($actual_order_id) {
-                error_log('GrandPay Payment: Found/Created actual order ID: ' . $actual_order_id);
-
-                // 実際の注文に一時的IDを関連付け
-                update_post_meta($actual_order_id, '_grandpay_temp_order_id', $order_id);
-                update_post_meta($actual_order_id, '_grandpay_session_id', $payment_result['session_id']);
-                update_post_meta($actual_order_id, '_grandpay_checkout_url', $payment_result['checkout_url']);
-                update_post_meta($actual_order_id, '_payment_method', 'grandpay');
-                update_post_meta($actual_order_id, '_grandpay_payment_status', 'pending');
-                update_post_meta($actual_order_id, '_grandpay_created_at', current_time('mysql'));
-
-                // 顧客・注文情報も保存
-                update_post_meta($actual_order_id, '_customer_email', $order_data['email']);
-                update_post_meta($actual_order_id, '_customer_name', $order_data['name']);
-                update_post_meta($actual_order_id, '_customer_phone', $order_data['phone']);
-                update_post_meta($actual_order_id, '_order_total', $order_data['amount']);
-
-                error_log('GrandPay Payment: Successfully linked temp ID ' . $order_id . ' to actual order ' . $actual_order_id);
-
-                // セッションに実際の注文IDも保存
-                $_SESSION['grandpay_temp_order']['actual_order_id'] = $actual_order_id;
-            } else {
-                error_log('GrandPay Payment: ❌ Failed to find or create actual order for temp ID: ' . $order_id);
-            }
-        } else {
-            // 通常の注文IDの場合
-            error_log('GrandPay Payment: Handling normal order ID: ' . $order_id);
-
-            // 注文の存在確認
-            $order = get_post($order_id);
-            if (!$order) {
-                error_log('GrandPay Payment: ❌ Order not found for ID: ' . $order_id);
-                return false;
-            }
-
-            // GrandPayセッション情報を保存
-            update_post_meta($order_id, '_grandpay_session_id', $payment_result['session_id']);
-            update_post_meta($order_id, '_grandpay_checkout_url', $payment_result['checkout_url']);
-            update_post_meta($order_id, '_payment_method', 'grandpay');
-            update_post_meta($order_id, '_grandpay_payment_status', 'pending');
-            update_post_meta($order_id, '_grandpay_created_at', current_time('mysql'));
-
-            // 注文データも保存
-            update_post_meta($order_id, '_customer_email', $order_data['email']);
-            update_post_meta($order_id, '_customer_name', $order_data['name']);
-            update_post_meta($order_id, '_customer_phone', $order_data['phone']);
-            update_post_meta($order_id, '_order_total', $order_data['amount']);
-        }
-
-        error_log('GrandPay Payment: ========== SAVE ORDER DATA END ==========');
-        return true;
-    }
-
-    /**
-     * 🔧 新規追加: 実際の注文を検索または作成
-     */
-    private function find_or_create_actual_order($order_data, $payment_result) {
-        global $usces;
-
-        error_log('GrandPay Payment: ========== FIND OR CREATE ORDER START ==========');
-
-        // 1. 最新の注文を検索（複数条件）
-        $search_criteria = array(
-            // 最近作成された注文
-            array(
-                'post_type' => 'shop_order',
-                'post_status' => array('draft', 'private', 'publish'),
-                'numberposts' => 10,
-                'orderby' => 'date',
-                'order' => 'DESC',
-                'date_query' => array(
-                    array(
-                        'after' => '30 minutes ago'  // 30分以内の注文
-                    )
-                )
-            ),
-            // カート情報が一致する注文
-            array(
-                'post_type' => 'shop_order',
-                'post_status' => array('draft', 'private', 'publish'),
-                'numberposts' => 5,
-                'orderby' => 'date',
-                'order' => 'DESC',
-                'meta_query' => array(
-                    array(
-                        'key' => '_customer_email',
-                        'value' => $order_data['email'],
-                        'compare' => '='
-                    )
-                )
-            )
-        );
-
-        foreach ($search_criteria as $index => $criteria) {
-            error_log('GrandPay Payment: Searching with criteria ' . ($index + 1));
-            $orders = get_posts($criteria);
-
-            error_log('GrandPay Payment: Found ' . count($orders) . ' orders with criteria ' . ($index + 1));
-
-            if (!empty($orders)) {
-                // 最も適切な注文を選択
-                $selected_order = $this->select_best_matching_order($orders, $order_data);
-
-                if ($selected_order) {
-                    error_log('GrandPay Payment: Selected order ID: ' . $selected_order->ID);
-                    return $selected_order->ID;
-                }
-            }
-        }
-
-        // 2. 🔧 注文が見つからない場合は作成
-        error_log('GrandPay Payment: No matching order found, creating new order');
-        $created_order_id = $this->create_order_from_session($order_data, $payment_result);
-
-        if ($created_order_id) {
-            error_log('GrandPay Payment: Successfully created new order: ' . $created_order_id);
-            return $created_order_id;
-        }
-
-        error_log('GrandPay Payment: ❌ Failed to find or create order');
-        error_log('GrandPay Payment: ========== FIND OR CREATE ORDER END ==========');
-        return false;
-    }
-
-    /**
-     * 🔧 新規追加: 最適な注文を選択
-     */
-    private function select_best_matching_order($orders, $order_data) {
-        error_log('GrandPay Payment: Selecting best matching order from ' . count($orders) . ' candidates');
-
-        foreach ($orders as $order) {
-            error_log('GrandPay Payment: Checking order ID: ' . $order->ID);
-
-            // 既にGrandPay決済が設定されている注文は除外
-            $existing_session = get_post_meta($order->ID, '_grandpay_session_id', true);
-            if (!empty($existing_session)) {
-                error_log('GrandPay Payment: Order ' . $order->ID . ' already has GrandPay session, skipping');
-                continue;
-            }
-
-            // 注文金額が一致するかチェック
-            $order_total = get_post_meta($order->ID, '_order_total', true);
-            if (empty($order_total)) {
-                $order_total = get_post_meta($order->ID, '_total_full_price', true);
-            }
-
-            error_log('GrandPay Payment: Order ' . $order->ID . ' total: ' . $order_total . ', Expected: ' . $order_data['amount']);
-
-            if (abs(intval($order_total) - intval($order_data['amount'])) <= 10) {  // 10円以内の誤差は許容
-                error_log('GrandPay Payment: Order ' . $order->ID . ' amount matches, selected');
-                return $order;
-            }
-        }
-
-        // 金額が一致しない場合は最新の注文を返す
-        if (!empty($orders)) {
-            error_log('GrandPay Payment: No amount match, returning latest order: ' . $orders[0]->ID);
-            return $orders[0];
-        }
-
-        return null;
-    }
-
-    /**
-     * 🔧 新規追加: セッション情報から注文を作成
-     */
-    private function create_order_from_session($order_data, $payment_result) {
-        global $usces;
-
-        error_log('GrandPay Payment: Creating new order from session data');
-
-        try {
-            // Welcartの注文作成処理
-            if (function_exists('usces_new_order_id')) {
-                $new_order_id = usces_new_order_id();
-                error_log('GrandPay Payment: Generated new order ID: ' . $new_order_id);
-            } else {
-                // フォールバック: 直接投稿作成
-                $order_post = array(
-                    'post_type' => 'shop_order',
-                    'post_status' => 'private',
-                    'post_title' => 'Order #' . time(),
-                    'post_content' => 'GrandPay Order',
-                    'post_author' => get_current_user_id()
-                );
-
-                $new_order_id = wp_insert_post($order_post);
-
-                if (is_wp_error($new_order_id)) {
-                    error_log('GrandPay Payment: Failed to create order post: ' . $new_order_id->get_error_message());
-                    return false;
-                }
-
-                error_log('GrandPay Payment: Created order post ID: ' . $new_order_id);
-            }
-
-            if ($new_order_id) {
-                // 基本的な注文メタデータを設定
-                $current_time = current_time('mysql');
-
-                update_post_meta($new_order_id, '_order_date', $current_time);
-                update_post_meta($new_order_id, '_order_status', 'pending');
-                update_post_meta($new_order_id, '_order_total', $order_data['amount']);
-                update_post_meta($new_order_id, '_total_full_price', $order_data['amount']);
-                update_post_meta($new_order_id, '_customer_email', $order_data['email']);
-                update_post_meta($new_order_id, '_customer_name', $order_data['name']);
-                update_post_meta($new_order_id, '_customer_phone', $order_data['phone']);
-                update_post_meta($new_order_id, '_payment_method', 'grandpay');
-
-                // カート情報をセッションから取得して保存
-                if (isset($usces->cart) && !empty($usces->cart->cart)) {
-                    update_post_meta($new_order_id, '_cart', $usces->cart->cart);
-                    error_log('GrandPay Payment: Cart data saved to order');
-                }
-
-                // 顧客情報をセッションから取得して保存
-                if (isset($_SESSION['usces_entry']['customer'])) {
-                    update_post_meta($new_order_id, '_customer_data', $_SESSION['usces_entry']['customer']);
-                    error_log('GrandPay Payment: Customer data saved to order');
-                }
-
-                error_log('GrandPay Payment: Order metadata saved for new order: ' . $new_order_id);
-                return $new_order_id;
-            }
-        } catch (Exception $e) {
-            error_log('GrandPay Payment: Exception creating order: ' . $e->getMessage());
-        }
-
-        return false;
     }
 
     /**
@@ -917,312 +364,308 @@ class WelcartGrandpayPaymentProcessor {
      * 注文完了処理（修正版 - Welcart連携強化）
      */
     private function complete_order($order_id, $payment_data) {
-        global $usces;
+        global $usces, $wpdb;
 
-        error_log('GrandPay Payment: Starting complete_order for order_id: ' . $order_id);
+        error_log('GrandPay Payment: 🚨 EMERGENCY FIX - Starting Welcart-force complete_order for order_id: ' . $order_id);
         error_log('GrandPay Payment: Payment data: ' . print_r($payment_data, true));
 
         try {
-            // 🔧 修正: 重複処理防止の強化
+            // 🔧 重複処理防止
             $current_status = get_post_meta($order_id, '_grandpay_payment_status', true);
             if ($current_status === 'completed') {
                 error_log('GrandPay Payment: Order already completed: ' . $order_id);
                 return true;
             }
 
-            // 処理中フラグを即座に設定（重複防止）
+            // 処理中フラグを即座に設定
             update_post_meta($order_id, '_grandpay_payment_status', 'processing');
             update_post_meta($order_id, '_grandpay_completion_started_at', current_time('mysql'));
 
-            // 🔧 修正: Welcart標準の注文完了処理を確実に実行
+            // 🚨 Step 1: Welcart注文テーブルの直接更新（強制）
+            $table_name = $wpdb->prefix . 'usces_order';
 
-            // 1. 注文ステータスを「注文完了」に更新
-            if (function_exists('usces_change_order_status')) {
-                $status_result = usces_change_order_status($order_id, 'ordercompletion');
-                error_log('GrandPay Payment: usces_change_order_status result: ' . print_r($status_result, true));
+            $welcart_update_result = $wpdb->update(
+                $table_name,
+                array(
+                    'order_status' => 'ordercompletion', // Welcart標準の完了ステータス
+                    'order_modified' => current_time('mysql')
+                ),
+                array('ID' => $order_id),
+                array('%s', '%s'),
+                array('%d')
+            );
 
-                if (is_wp_error($status_result)) {
-                    error_log('GrandPay Payment: usces_change_order_status error: ' . $status_result->get_error_message());
-                    // エラーでも処理を続行（フォールバック処理あり）
-                }
-            } else {
-                error_log('GrandPay Payment: usces_change_order_status not found, using manual update');
+            if ($welcart_update_result === false) {
+                error_log('GrandPay Payment: Failed to update Welcart order status: ' . $wpdb->last_error);
+                throw new Exception('Welcart注文ステータス更新に失敗しました');
             }
 
-            // 2. フォールバック: 直接ステータス更新
-            update_post_meta($order_id, '_order_status', 'ordercompletion');
-            update_post_meta($order_id, '_acting_return', 'completion');
+            error_log('GrandPay Payment: ✅ Welcart order status updated to ordercompletion');
 
-            // 🔧 新規追加: Welcart決済完了の追加メタデータ
-            update_post_meta($order_id, '_acting_status', 'completion');
-            update_post_meta($order_id, '_settlement_result', 'success');
-            update_post_meta($order_id, '_payment_status', 'completed');
-            update_post_meta($order_id, '_payment_completion_date', current_time('mysql'));
+            // 🚨 Step 2: Welcart標準の在庫管理を強制実行
+            error_log('GrandPay Payment: 🚨 FORCING Welcart inventory management...');
+            $this->force_welcart_inventory_management($order_id);
 
-            // 3. 投稿ステータスを公開に更新
-            $post_update_result = wp_update_post(array(
-                'ID' => $order_id,
-                'post_status' => 'publish'
-            ), true);
+            // 🚨 Step 3: Welcartのポイント処理を強制実行
+            error_log('GrandPay Payment: 🚨 FORCING Welcart point processing...');
+            $this->force_welcart_point_processing($order_id);
 
-            if (is_wp_error($post_update_result)) {
-                error_log('GrandPay Payment: Failed to update post status: ' . $post_update_result->get_error_message());
-            } else {
-                error_log('GrandPay Payment: Post status updated to publish');
-            }
+            // 🔧 Step 4: メール送信はスキップ（ユーザーリクエスト）
+            error_log('GrandPay Payment: Email notifications skipped (user request)');
 
-            // 4. 🔧 修正: GrandPay決済情報を保存
+            // 🔧 Step 4: GrandPay固有情報の保存
             update_post_meta($order_id, '_grandpay_payment_status', 'completed');
             update_post_meta($order_id, '_grandpay_transaction_id', $payment_data['id'] ?? '');
             update_post_meta($order_id, '_grandpay_completed_at', current_time('mysql'));
             update_post_meta($order_id, '_grandpay_payment_data', $payment_data);
 
-            // 5. Welcart標準の決済情報フィールドも更新
-            if (isset($payment_data['id'])) {
-                update_post_meta($order_id, '_wc_trans_id', $payment_data['id']); // Welcart標準
-                update_post_meta($order_id, '_tracking_id', $payment_data['id']); // 追跡ID
-            }
-
-            // 決済方法情報
+            // 🔧 Step 5: Welcart標準フィールドの設定
+            update_post_meta($order_id, '_wc_trans_id', $payment_data['id'] ?? ''); // Welcart標準の取引ID
+            update_post_meta($order_id, '_acting_return', 'completion'); // Welcart標準の決済結果
             update_post_meta($order_id, '_payment_method', 'grandpay');
             update_post_meta($order_id, '_settlement', 'grandpay');
 
-            // 6. 🔧 修正: カートクリア処理を復活（安全な方法で）
-            error_log('GrandPay Payment: Attempting cart clear...');
+            // 🚨 Step 7: Welcart標準フックを強制実行
+            error_log('GrandPay Payment: 🚨 FORCING Welcart standard hooks...');
 
-            if (isset($usces->cart) && method_exists($usces->cart, 'empty_cart')) {
-                try {
-                    $usces->cart->empty_cart();
-                    error_log('GrandPay Payment: Cart cleared successfully using empty_cart()');
-                } catch (Exception $e) {
-                    error_log('GrandPay Payment: Cart clear method 1 failed: ' . $e->getMessage());
-
-                    // フォールバック: セッション直接クリア
-                    $this->clear_cart_fallback();
-                }
-            } else {
-                error_log('GrandPay Payment: empty_cart method not available, using fallback');
-                $this->clear_cart_fallback();
-            }
-
-            // 7. 🔧 修正: 在庫管理処理（エラーハンドリング強化）
-            try {
-                $this->process_inventory_update($order_id);
-                error_log('GrandPay Payment: Inventory update completed');
-            } catch (Exception $e) {
-                error_log('GrandPay Payment: Inventory update failed: ' . $e->getMessage());
-                // 在庫更新失敗は注文完了を阻害しない
-            }
-
-            // 8. 🔧 削除: メール通知処理を削除（ユーザーリクエスト）
-            error_log('GrandPay Payment: Email notifications skipped (disabled by request)');
-
-            // 9. 🔧 修正: Welcart標準のorder completionアクションを実行
-            error_log('GrandPay Payment: Executing Welcart completion hooks...');
-
-            // Welcartの注文完了フックを実行
+            // 注文完了アクション
             do_action('usces_action_order_completion', $order_id);
 
-            // 決済完了フックも実行
+            // 決済完了アクション
             do_action('usces_action_acting_return', array(
                 'order_id' => $order_id,
                 'acting' => 'grandpay',
                 'result' => 'completion'
             ));
 
+            // 🚨 Step 8: Welcartの注文ステータス変更関数を強制実行
+            if (function_exists('usces_change_order_status')) {
+                $status_change_result = usces_change_order_status($order_id, 'ordercompletion');
+
+                if (is_wp_error($status_change_result)) {
+                    error_log('GrandPay Payment: usces_change_order_status error: ' . $status_change_result->get_error_message());
+                } else {
+                    error_log('GrandPay Payment: ✅ usces_change_order_status completed successfully');
+                }
+            }
+
+            // 🔧 Step 9: セッションクリア
+            $this->clear_welcart_session();
+
+            // 🔧 Step 10: 最終確認
+            $final_status = $wpdb->get_var($wpdb->prepare(
+                "SELECT order_status FROM {$table_name} WHERE ID = %d",
+                $order_id
+            ));
+
+            error_log('GrandPay Payment: Final Welcart order status: ' . $final_status);
+            error_log('GrandPay Payment: ✅ 🚨 EMERGENCY FIX - Welcart-force order completion finished successfully - ID: ' . $order_id);
+
             // GrandPay固有のフック
             do_action('grandpay_payment_completed', $order_id, $payment_data);
 
-            // 10. 最終ステータス確認
-            $final_order_status = get_post_meta($order_id, '_order_status', true);
-            $final_post_status = get_post_status($order_id);
-
-            error_log('GrandPay Payment: Order completion finished');
-            error_log('GrandPay Payment: Final order status: ' . $final_order_status);
-            error_log('GrandPay Payment: Final post status: ' . $final_post_status);
-
-            // 成功ログ
-            error_log('GrandPay Payment: ✅ Order completed successfully - ID: ' . $order_id);
-
             return true;
         } catch (Exception $e) {
-            error_log('GrandPay Payment: ❌ Exception in complete_order: ' . $e->getMessage());
+            error_log('GrandPay Payment: ❌ Exception in emergency fix complete_order: ' . $e->getMessage());
             error_log('GrandPay Payment: Exception trace: ' . $e->getTraceAsString());
 
-            // エラー時は失敗状態に設定
+            // エラー時の状態設定
             update_post_meta($order_id, '_grandpay_payment_status', 'error');
             update_post_meta($order_id, '_grandpay_error_message', $e->getMessage());
             update_post_meta($order_id, '_grandpay_error_at', current_time('mysql'));
 
-            // エラーでも基本的な注文情報は保存する
-            update_post_meta($order_id, '_grandpay_transaction_id', $payment_data['id'] ?? '');
-            update_post_meta($order_id, '_payment_method', 'grandpay');
-
-            throw $e; // 上位でキャッチできるよう再スロー
+            throw $e;
         }
     }
 
     /**
-     * 🔧 新規追加: カートクリアのフォールバック処理
+     * 🚨 新規追加: Welcart在庫管理の強制実行
      */
-    private function clear_cart_fallback() {
+    private function force_welcart_inventory_management($order_id) {
         try {
-            // セッションからカート情報を直接削除
-            if (isset($_SESSION['usces_cart'])) {
-                unset($_SESSION['usces_cart']);
-                error_log('GrandPay Payment: Cart cleared via session unset');
+            error_log('GrandPay Payment: 🚨 Starting forced inventory management for order: ' . $order_id);
+
+            // Welcartの注文データから商品情報を取得
+            global $wpdb;
+            $table_name = $wpdb->prefix . 'usces_order';
+
+            $order = $wpdb->get_row($wpdb->prepare(
+                "SELECT * FROM {$table_name} WHERE ID = %d",
+                $order_id
+            ), ARRAY_A);
+
+            if (!$order) {
+                error_log('GrandPay Payment: Order not found for inventory management');
+                return false;
             }
 
-            // Welcartのカート関連セッションを削除
-            $cart_session_keys = array(
+            // カート情報をアンシリアライズ
+            $cart_data = unserialize($order['order_cart']);
+
+            if (is_array($cart_data) && !empty($cart_data)) {
+                error_log('GrandPay Payment: Processing ' . count($cart_data) . ' cart items for inventory');
+
+                foreach ($cart_data as $item_index => $cart_item) {
+                    $post_id = intval($cart_item['post_id'] ?? 0);
+                    $sku = sanitize_text_field($cart_item['sku'] ?? '');
+                    $quantity = intval($cart_item['quantity'] ?? 0);
+
+                    if ($post_id && $sku && $quantity > 0) {
+                        // 🚨 Welcartの在庫減算関数を直接呼び出し
+                        if (function_exists('usces_update_item_stock')) {
+                            $stock_result = usces_update_item_stock($post_id, $sku, $quantity);
+                            error_log("GrandPay Payment: 🚨 FORCED stock update for {$post_id}:{$sku} (-{$quantity}): " . print_r($stock_result, true));
+                        } else {
+                            // フォールバック: 直接在庫を減算
+                            $this->direct_stock_reduction($post_id, $sku, $quantity);
+                        }
+                    } else {
+                        error_log("GrandPay Payment: Skipping invalid item: post_id={$post_id}, sku={$sku}, quantity={$quantity}");
+                    }
+                }
+            } else {
+                error_log('GrandPay Payment: No cart data found for inventory management');
+            }
+
+            update_post_meta($order_id, '_grandpay_inventory_updated', current_time('mysql'));
+            error_log('GrandPay Payment: ✅ Forced inventory management completed');
+        } catch (Exception $e) {
+            error_log('GrandPay Payment: Error in forced inventory management: ' . $e->getMessage());
+            update_post_meta($order_id, '_grandpay_inventory_error', $e->getMessage());
+        }
+    }
+
+    /**
+     * 🚨 新規追加: 直接在庫減算（フォールバック用）
+     */
+    private function direct_stock_reduction($post_id, $sku, $quantity) {
+        try {
+            // Welcartの在庫データを直接操作
+            $current_stock = get_post_meta($post_id, '_stock', true);
+
+            if (is_numeric($current_stock) && $current_stock >= $quantity) {
+                $new_stock = $current_stock - $quantity;
+                update_post_meta($post_id, '_stock', $new_stock);
+                error_log("GrandPay Payment: 🚨 DIRECT stock reduction: {$post_id}:{$sku} {$current_stock} -> {$new_stock}");
+            } else {
+                error_log("GrandPay Payment: Insufficient stock for {$post_id}:{$sku} (current: {$current_stock}, requested: {$quantity})");
+            }
+        } catch (Exception $e) {
+            error_log('GrandPay Payment: Error in direct stock reduction: ' . $e->getMessage());
+        }
+    }
+
+    /**
+     * 🚨 新規追加: Welcartポイント処理の強制実行
+     */
+    private function force_welcart_point_processing($order_id) {
+        try {
+            error_log('GrandPay Payment: 🚨 Starting forced point processing for order: ' . $order_id);
+
+            // Welcartの注文データを取得
+            global $wpdb;
+            $table_name = $wpdb->prefix . 'usces_order';
+
+            $order = $wpdb->get_row($wpdb->prepare(
+                "SELECT * FROM {$table_name} WHERE ID = %d",
+                $order_id
+            ), ARRAY_A);
+
+            if (!$order) {
+                error_log('GrandPay Payment: Order not found for point processing');
+                return false;
+            }
+
+            $member_id = $order['mem_id'];
+            $getpoint = intval($order['order_getpoint']);
+            $usedpoint = intval($order['order_usedpoint']);
+
+            if ($member_id && $getpoint > 0) {
+                // 🚨 Welcartのポイント付与関数を直接呼び出し
+                if (function_exists('usces_add_point')) {
+                    $point_result = usces_add_point($member_id, $getpoint, $order_id);
+                    error_log("GrandPay Payment: 🚨 FORCED point addition: member {$member_id} + {$getpoint} points");
+                } else {
+                    // フォールバック: 直接ポイントを追加
+                    $this->direct_point_addition($member_id, $getpoint, $order_id);
+                }
+            }
+
+            update_post_meta($order_id, '_grandpay_points_processed', current_time('mysql'));
+            error_log('GrandPay Payment: ✅ Forced point processing completed');
+        } catch (Exception $e) {
+            error_log('GrandPay Payment: Error in forced point processing: ' . $e->getMessage());
+            update_post_meta($order_id, '_grandpay_points_error', $e->getMessage());
+        }
+    }
+
+    /**
+     * 🚨 新規追加: 直接ポイント追加（フォールバック用）
+     */
+    private function direct_point_addition($member_id, $points, $order_id) {
+        try {
+            global $wpdb;
+
+            // 会員の現在のポイントを取得
+            $member_table = $wpdb->prefix . 'usces_member';
+            $current_points = $wpdb->get_var($wpdb->prepare(
+                "SELECT mem_point FROM {$member_table} WHERE ID = %d",
+                $member_id
+            ));
+
+            if ($current_points !== null) {
+                $new_points = intval($current_points) + $points;
+
+                $update_result = $wpdb->update(
+                    $member_table,
+                    array('mem_point' => $new_points),
+                    array('ID' => $member_id),
+                    array('%d'),
+                    array('%d')
+                );
+
+                if ($update_result !== false) {
+                    error_log("GrandPay Payment: 🚨 DIRECT point addition: member {$member_id} {$current_points} -> {$new_points}");
+                }
+            }
+        } catch (Exception $e) {
+            error_log('GrandPay Payment: Error in direct point addition: ' . $e->getMessage());
+        }
+    }
+
+
+
+    /**
+     * Welcart標準のセッションクリア（既存のまま）
+     */
+    private function clear_welcart_session() {
+        try {
+            global $usces;
+
+            // Welcartの標準的なカートクリア
+            if (isset($usces->cart) && method_exists($usces->cart, 'empty_cart')) {
+                $usces->cart->empty_cart();
+                error_log('GrandPay Payment: ✅ Welcart cart cleared using standard method');
+            }
+
+            // Welcart標準のセッションクリア
+            $welcart_session_keys = array(
                 'usces_cart',
-                'usces_cart_total',
-                'usces_cart_items',
-                'usces_entry'
+                'usces_entry',
+                'usces_member_regmode',
+                'usces_checkout'
             );
 
-            foreach ($cart_session_keys as $key) {
+            foreach ($welcart_session_keys as $key) {
                 if (isset($_SESSION[$key])) {
                     unset($_SESSION[$key]);
                     error_log('GrandPay Payment: Cleared session key: ' . $key);
                 }
             }
 
-            error_log('GrandPay Payment: Fallback cart clear completed');
+            error_log('GrandPay Payment: ✅ Welcart session cleared');
         } catch (Exception $e) {
-            error_log('GrandPay Payment: Fallback cart clear failed: ' . $e->getMessage());
-            // カートクリア失敗でも処理継続
-        }
-    }
-
-    /**
-     * 🔧 新規追加: 在庫管理処理
-     */
-    private function process_inventory_update($order_id) {
-        try {
-            error_log('GrandPay Payment: Starting inventory update for order: ' . $order_id);
-
-            // Welcartの在庫減算処理
-            if (function_exists('usces_update_item_stock')) {
-                $cart_data = get_post_meta($order_id, '_cart', true);
-
-                if ($cart_data && is_array($cart_data)) {
-                    error_log('GrandPay Payment: Processing ' . count($cart_data) . ' cart items for stock update');
-
-                    foreach ($cart_data as $item_index => $cart_item) {
-                        $post_id = intval($cart_item['post_id'] ?? 0);
-                        $sku = sanitize_text_field($cart_item['sku'] ?? '');
-                        $quantity = intval($cart_item['quantity'] ?? 0);
-
-                        if ($post_id && $sku && $quantity > 0) {
-                            $stock_result = usces_update_item_stock($post_id, $sku, $quantity);
-                            error_log("GrandPay Payment: Stock updated for {$post_id}:{$sku} (-{$quantity}): " . print_r($stock_result, true));
-
-                            // 在庫更新結果をログに記録
-                            if (is_wp_error($stock_result)) {
-                                error_log("GrandPay Payment: Stock update error for {$post_id}:{$sku}: " . $stock_result->get_error_message());
-                            }
-                        } else {
-                            error_log("GrandPay Payment: Skipping stock update for invalid item: post_id={$post_id}, sku={$sku}, quantity={$quantity}");
-                        }
-                    }
-                } else {
-                    error_log('GrandPay Payment: No cart data found for stock update');
-                }
-            } else {
-                error_log('GrandPay Payment: usces_update_item_stock function not found');
-            }
-
-            // 在庫更新完了をマーク
-            update_post_meta($order_id, '_grandpay_inventory_updated', current_time('mysql'));
-        } catch (Exception $e) {
-            error_log('GrandPay Payment: Error in inventory update: ' . $e->getMessage());
-            update_post_meta($order_id, '_grandpay_inventory_error', $e->getMessage());
-            // 在庫更新エラーは注文完了を阻害しない
-        }
-    }
-
-    /**
-     * 🔧 新規追加: 完了通知メール送信
-     */
-    private function send_completion_notifications($order_id) {
-        try {
-            error_log('GrandPay Payment: Starting notification emails for order: ' . $order_id);
-
-            // 顧客向け完了メール
-            if (function_exists('usces_send_order_mail')) {
-                $customer_mail_result = usces_send_order_mail($order_id, 'completion');
-                error_log('GrandPay Payment: Customer completion mail result: ' . print_r($customer_mail_result, true));
-            } else {
-                error_log('GrandPay Payment: usces_send_order_mail function not found');
-            }
-
-            // 管理者向け通知メール
-            if (function_exists('usces_send_admin_mail')) {
-                $admin_mail_result = usces_send_admin_mail($order_id, 'completion');
-                error_log('GrandPay Payment: Admin notification mail result: ' . print_r($admin_mail_result, true));
-            } else {
-                error_log('GrandPay Payment: usces_send_admin_mail function not found');
-            }
-
-            // 🔧 フォールバック: Welcart標準メール関数が無い場合の代替処理
-            if (!function_exists('usces_send_order_mail') && !function_exists('usces_send_admin_mail')) {
-                $this->send_fallback_notification_email($order_id);
-            }
-
-            // メール送信完了をマーク
-            update_post_meta($order_id, '_grandpay_notifications_sent', current_time('mysql'));
-        } catch (Exception $e) {
-            error_log('GrandPay Payment: Error in sending notifications: ' . $e->getMessage());
-            update_post_meta($order_id, '_grandpay_notification_error', $e->getMessage());
-            // メール送信エラーは注文完了を阻害しない
-        }
-    }
-
-    private function send_fallback_notification_email($order_id) {
-        try {
-            $customer_email = get_post_meta($order_id, '_customer_email', true);
-            $customer_name = get_post_meta($order_id, '_customer_name', true);
-            $order_total = get_post_meta($order_id, '_order_total', true);
-
-            if (empty($customer_email)) {
-                error_log('GrandPay Payment: No customer email found for fallback notification');
-                return;
-            }
-
-            $subject = '[' . get_bloginfo('name') . '] ご注文完了のお知らせ (注文番号: ' . $order_id . ')';
-
-            $message = "
-{$customer_name} 様
-
-この度はご注文いただき、ありがとうございます。
-お支払いが正常に完了いたしました。
-
-【注文情報】
-注文番号: {$order_id}
-ご注文金額: ¥" . number_format($order_total) . "
-決済方法: クレジットカード決済（GrandPay）
-完了日時: " . current_time('Y年n月j日 H:i') . "
-
-今後ともよろしくお願いいたします。
-
-" . get_bloginfo('name') . "
-" . home_url();
-
-            $headers = array(
-                'Content-Type: text/plain; charset=UTF-8',
-                'From: ' . get_bloginfo('name') . ' <' . get_option('admin_email') . '>'
-            );
-
-            $mail_result = wp_mail($customer_email, $subject, $message, $headers);
-
-            if ($mail_result) {
-                error_log('GrandPay Payment: Fallback notification email sent successfully');
-            } else {
-                error_log('GrandPay Payment: Fallback notification email failed');
-            }
-        } catch (Exception $e) {
-            error_log('GrandPay Payment: Error in fallback notification email: ' . $e->getMessage());
+            error_log('GrandPay Payment: Warning - Session clear failed: ' . $e->getMessage());
         }
     }
 
@@ -1230,40 +673,58 @@ class WelcartGrandpayPaymentProcessor {
      * 注文失敗処理（修正版 - エラーハンドリング強化）
      */
     private function fail_order($order_id) {
-        global $usces;
+        global $wpdb;
 
-        error_log('GrandPay Payment: Starting fail_order for order_id: ' . $order_id);
+        error_log('GrandPay Payment: Starting Welcart-standard fail_order for order_id: ' . $order_id);
 
         try {
-            // 🔧 修正: 重複処理防止
+            // 重複処理防止
             $current_status = get_post_meta($order_id, '_grandpay_payment_status', true);
             if ($current_status === 'failed') {
                 error_log('GrandPay Payment: Order already failed: ' . $order_id);
                 return;
             }
 
-            // 1. Welcart標準の注文ステータス更新
-            if (function_exists('usces_change_order_status')) {
-                $status_result = usces_change_order_status($order_id, 'cancel');
-                error_log('GrandPay Payment: Order status changed to cancel: ' . print_r($status_result, true));
-            } else {
-                // フォールバック
-                update_post_meta($order_id, '_order_status', 'cancel');
-            }
+            // 🔧 Welcart注文テーブルのステータス更新
+            $table_name = $wpdb->prefix . 'usces_order';
 
-            // 2. 決済情報を更新
+            $wpdb->update(
+                $table_name,
+                array(
+                    'order_status' => 'cancel', // Welcart標準のキャンセルステータス
+                    'order_modified' => current_time('mysql')
+                ),
+                array('ID' => $order_id),
+                array('%s', '%s'),
+                array('%d')
+            );
+
+            // GrandPay固有情報の更新
             update_post_meta($order_id, '_grandpay_payment_status', 'failed');
             update_post_meta($order_id, '_grandpay_failed_at', current_time('mysql'));
             update_post_meta($order_id, '_acting_return', 'failure');
 
-            error_log('GrandPay Payment: Order failed - ID: ' . $order_id);
+            // 🔧 Welcart標準の失敗処理を実行
+            if (function_exists('usces_change_order_status')) {
+                usces_change_order_status($order_id, 'cancel');
+            }
 
-            // 3. 失敗フックを実行
+            // Welcart標準の失敗フックを実行
+            do_action('usces_action_acting_return', array(
+                'order_id' => $order_id,
+                'acting' => 'grandpay',
+                'result' => 'failure'
+            ));
+
+            error_log('GrandPay Payment: ✅ Welcart-standard order failure processing completed - ID: ' . $order_id);
+
+            // GrandPay固有のフック
             do_action('grandpay_payment_failed', $order_id);
         } catch (Exception $e) {
             error_log('GrandPay Payment: Exception in fail_order: ' . $e->getMessage());
         }
     }
+
 
     /**
      * 🔧 修正: エラー時のリダイレクト（URL修正版）
@@ -1409,30 +870,27 @@ class WelcartGrandpayPaymentProcessor {
      * 決済成功Webhook処理
      */
     private function process_payment_webhook($data) {
-        error_log('GrandPay Payment: ========== WEBHOOK ORDER CREATION START ==========');
+        error_log('GrandPay Payment: ========== WEBHOOK ORDER PROCESSING START ==========');
 
         // Webhookデータから情報抽出
         $payment_id = $data['data']['id'] ?? '';
         $session_id = $data['data']['metadata']['checkoutSessionId'] ?? '';
         $payment_status = $data['data']['status'] ?? '';
         $amount = floatval($data['data']['amount'] ?? 0);
-        $currency = $data['data']['currency'] ?? 'JPY';
         $customer_email = $data['data']['to'] ?? '';
         $customer_name = $data['data']['recipientName'] ?? '';
-        $product_names = $data['data']['productNames'] ?? array();
 
         error_log('GrandPay Payment: Webhook payment ID: ' . $payment_id);
         error_log('GrandPay Payment: Webhook session ID: ' . $session_id);
-        error_log('GrandPay Payment: Webhook amount: ' . $amount);
-        error_log('GrandPay Payment: Webhook customer: ' . $customer_name . ' (' . $customer_email . ')');
+        error_log('GrandPay Payment: Webhook status: ' . $payment_status);
 
-        // 🔧 重要：決済が成功していない場合は処理しない
+        // 決済が成功していない場合は処理しない
         if (strtoupper($payment_status) !== 'COMPLETED') {
             error_log('GrandPay Payment: Payment not completed, status: ' . $payment_status);
             return false;
         }
 
-        // まず既存の注文を検索
+        // 既存の注文を検索
         $existing_order_id = $this->find_order_by_session_id($session_id);
         if (!$existing_order_id) {
             $existing_order_id = $this->find_order_by_payment_id($payment_id);
@@ -1448,25 +906,17 @@ class WelcartGrandpayPaymentProcessor {
                 return true;
             }
 
-            // 既存注文を完了処理
-            $this->complete_existing_order($existing_order_id, $data['data']);
+            // 🔧 重要: Welcart標準の完了処理を呼び出し
+            $this->complete_order($existing_order_id, $data['data']);
             return true;
         }
 
-        // 🔧 新規：Webhook情報からWelcart注文を作成
-        error_log('GrandPay Payment: No existing order found, creating new Welcart order');
-        $new_order_id = $this->create_welcart_order_from_webhook($data['data']);
+        // 注文が見つからない場合のログ
+        error_log('GrandPay Payment: ⚠️ No existing order found for webhook');
+        error_log('GrandPay Payment: This may be normal if the payment was completed via redirect');
 
-        if ($new_order_id) {
-            error_log('GrandPay Payment: Successfully created Welcart order: ' . $new_order_id);
-            $this->complete_existing_order($new_order_id, $data['data']);
-            return true;
-        } else {
-            error_log('GrandPay Payment: Failed to create Welcart order from webhook');
-            return false;
-        }
+        return false;
     }
-
     private function complete_existing_order($order_id, $payment_data) {
         error_log('GrandPay Payment: === COMPLETING EXISTING ORDER ===');
         error_log('GrandPay Payment: Order ID: ' . $order_id);
